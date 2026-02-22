@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Anthropic-compatible API proxy backed by AWS Bedrock,
+  with full streaming support via API Gateway response streaming.
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 256
+
+Parameters:
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID (leave empty to skip custom domain setup)
+    Default: ''
+  DomainName:
+    Type: String
+    Description: Custom domain name for the API (e.g. anthropic.example.com)
+    Default: ''
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+    - !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+  # ---- Lambda Function ----
+  ProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda.handler
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+
+  # ---- API Gateway REST API ----
+  ProxyApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: bedrock-anthropic-proxy
+      Description: Anthropic-compatible API backed by Bedrock
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Request validator — reject requests missing x-api-key before hitting Lambda
+  HeaderValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref ProxyApi
+      Name: require-x-api-key
+      ValidateRequestParameters: true
+      ValidateRequestBody: false
+
+  # /v1 resource
+  V1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ProxyApi
+      ParentId: !GetAtt ProxyApi.RootResourceId
+      PathPart: v1
+
+  # /v1/messages resource
+  MessagesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ProxyApi
+      ParentId: !Ref V1Resource
+      PathPart: messages
+
+  # POST /v1/messages — streaming proxy to Lambda
+  MessagesPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ProxyApi
+      ResourceId: !Ref MessagesResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref HeaderValidator
+      RequestParameters:
+        method.request.header.x-api-key: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        ResponseTransferMode: STREAM
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ProxyFunction.Arn}/response-streaming-invocations
+        TimeoutInMillis: 900000
+
+  # OPTIONS /v1/messages — CORS preflight (handled at API Gateway, no Lambda invocation)
+  MessagesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ProxyApi
+      ResourceId: !Ref MessagesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST, OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type, x-api-key, anthropic-version, anthropic-beta'"
+              method.response.header.Access-Control-Max-Age: "'86400'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - MessagesPostMethod
+      - MessagesOptionsMethod
+    Properties:
+      RestApiId: !Ref ProxyApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ProxyApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: api
+
+  # Lambda permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ProxyApi}/*
+
+  # ---- Custom Domain (conditional) ----
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  ApiDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      RegionalCertificateArn: !Ref Certificate
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      RestApiId: !Ref ProxyApi
+      Stage: !Ref ApiStage
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomainName.RegionalHostedZoneId
+
+
+Outputs:
+  Endpoint:
+    Description: API endpoint URL (use as Anthropic base_url)
+    Value: !If
+      - HasCustomDomain
+      - !Sub https://${DomainName}
+      - !Sub https://${ProxyApi}.execute-api.${AWS::Region}.amazonaws.com/api

@@ -1,0 +1,15 @@
+# SAM CLI configuration
+# Run `sam deploy --guided` for first-time setup to populate this file.
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "bedrock-anthropic-proxy"
+resolve_s3 = true
+s3_prefix = "bedrock-anthropic-proxy"
+region = "us-west-2"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+
+[default.build.parameters]
+use_container = false
